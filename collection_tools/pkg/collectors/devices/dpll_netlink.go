@@ -29,8 +29,17 @@ var states = map[string]string{
 
 const (
 	OnePPSLabel = "GNSS-1PPS"
-	SMA1Label   = "SMA1"
-	SMA2Label   = "SMA2"
+	// GNSS1PPSInLabel is the E825 board label for the GNSS 1PPS reference
+	// input. Board labels for the same pin differ between platforms, see
+	// the linuxptp-daemon "e825-tbc-dpll-input-pins" spec for evidence.
+	GNSS1PPSInLabel = "GNSS_1PPS_IN"
+	SMA1Label       = "SMA1"
+	SMA2Label       = "SMA2"
+
+	// GNSSPackageLabelPrefix matches the package labels (REF4P/REF4N) of
+	// the GNSS reference input. Package labels are stable across platforms
+	// even where board labels differ.
+	GNSSPackageLabelPrefix = "REF4"
 
 	OnePPSSubtype  = "dpll"
 	SMA1Subtype    = "dpll-sma1"
@@ -38,10 +47,18 @@ const (
 
 	InputDirection = "input"
 	ConnectedState = "connected"
+	// SelectableState is reported by the zl3073x driver for the active
+	// reference input (with the highest priority) where the ice driver
+	// reports "connected".
+	SelectableState = "selectable"
 
 	EECOffsetParentID      = 0
 	PPSOffesetParentID     = 1
 	DPLLPhaseOffsetDivider = 1000
+
+	// sysfsPinsKey is the fetcher key holding the sysfs pin directory
+	// listing of the collected interface.
+	sysfsPinsKey = "dpll-netlink-sysfs-pins"
 )
 
 type DevNetlinkDPLLInfo struct {
@@ -117,6 +134,7 @@ type NetlinkPin struct {
 	Type                 string                            `json:"type"`                //nolint:tagliatelle // not my choice
 	ModuleName           string                            `json:"module-name"`         //nolint:tagliatelle // not my choice
 	Label                string                            `json:"board-label"`         //nolint:tagliatelle // not my choice
+	PackageLabel         string                            `json:"package-label"`       //nolint:tagliatelle // not my choice
 	Capabilities         []string                          `json:"capabilities"`        //nolint:tagliatelle // not my choice
 	FrequenciesSupported []*NetlinkFrequencySupportedRange `json:"frequency-supported"` //nolint:tagliatelle // not my choice
 	ParentDevices        []*NetlinkParentDevice            `json:"parent-device"`       //nolint:tagliatelle // not my choice
@@ -407,6 +425,14 @@ func BuildNetlinkInfoFetcher(interfaceName string) error {
 				Trim: true,
 			},
 			{
+				Key: sysfsPinsKey,
+				Command: fmt.Sprintf(
+					`ls /sys/class/net/%s/device/ptp/*/pins/ 2>/dev/null || true`,
+					interfaceName,
+				),
+				Trim: true,
+			},
+			{
 				Key:     "dpll-netlink-pins",
 				Command: "dpll -j pin show",
 				Trim:    true,
@@ -429,7 +455,58 @@ func BuildNetlinkInfoFetcher(interfaceName string) error {
 	return nil
 }
 
-func selectPin(pinsJSON []byte, clockID uint64) (int32, string, error) { //nolint:funlen,gocritic,cyclop // allow slightly longer function for sake of readability
+// isOnePPSReferencePin reports whether the pin is the GNSS 1PPS reference
+// input of its DPLL. The board label differs between platforms (E810
+// reports "GNSS-1PPS", E825 reports "GNSS_1PPS_IN") while the package
+// label is stable, so both are accepted.
+func isOnePPSReferencePin(pin *NetlinkPin) bool {
+	if pin.Label == OnePPSLabel || pin.Label == GNSS1PPSInLabel {
+		return true
+	}
+
+	return strings.HasPrefix(pin.PackageLabel, GNSSPackageLabelPrefix)
+}
+
+// isUsablePinState reports whether a parent device state allows the pin to
+// be used as an offset measurement point. The ice driver reports the
+// active reference as "connected" while the zl3073x driver reports it as
+// "selectable" (with the highest priority), so both are accepted.
+func isUsablePinState(state string) bool {
+	return state == ConnectedState || state == SelectableState
+}
+
+// hasSysfsSMAPinName reports whether the sysfs pin listing of an interface
+// contains an SMA1 pin, matching how the linuxptp-daemon detects SMA
+// capable hardware.
+func hasSysfsSMAPinName(sysfsPins string) bool {
+	for name := range strings.FieldsSeq(sysfsPins) {
+		if name == SMA1Label {
+			return true
+		}
+	}
+
+	return false
+}
+
+// pinParentsUsable reports whether all parent devices of the pin are in a
+// usable state, optionally requiring input direction.
+func pinParentsUsable(pin *NetlinkPin, requireInput bool) bool {
+	for _, parentDev := range pin.ParentDevices {
+		if requireInput && parentDev.Direction != InputDirection {
+			log.Debugf("selectPin: pin ID=%d rejected - parent device not an input (direction=%s)", pin.ID, parentDev.Direction)
+			return false
+		}
+
+		if !isUsablePinState(parentDev.State) {
+			log.Debugf("selectPin: pin ID=%d rejected - parent device not usable (state=%s)", pin.ID, parentDev.State)
+			return false
+		}
+	}
+
+	return true
+}
+
+func selectPin(pinsJSON []byte, clockID uint64, sysfsPins string) (int32, string, error) { //nolint:funlen,gocritic,cyclop,gocyclo // allow slightly longer function for sake of readability
 	entries, err := parsePinListJSON(pinsJSON)
 	if err != nil {
 		return 0, "", fmt.Errorf("failed to unmarshal netlink output: %w", err)
@@ -439,9 +516,14 @@ func selectPin(pinsJSON []byte, clockID uint64) (int32, string, error) { //nolin
 		return 0, "", utils.NewRequirementsNotMetError(errors.New("no pins found"))
 	}
 
+	// SMA1 pins are only considered when the sysfs pin directory of the
+	// interface reports one. This avoids selecting unrelated pins on
+	// hardware without SMA connectors.
+	sysfsSMA1 := hasSysfsSMAPinName(sysfsPins)
+
 	var OnePPSPin, SMA1Pin *NetlinkPin
 
-	log.Debugf("selectPin: looking for clockID %d among %d pins", clockID, len(entries))
+	log.Debugf("selectPin: looking for clockID %d among %d pins (sysfs SMA1: %v)", clockID, len(entries), sysfsSMA1)
 
 	matchingPinCount := 0
 	for _, pin := range entries {
@@ -452,10 +534,11 @@ func selectPin(pinsJSON []byte, clockID uint64) (int32, string, error) { //nolin
 		matchingPinCount++
 		log.Debugf("selectPin: found matching pin ID=%d label=%s type=%s", pin.ID, pin.Label, pin.Type)
 
-		switch pin.Label {
-		case OnePPSLabel:
+		if isOnePPSReferencePin(pin) {
 			OnePPSPin = pin
-		case SMA1Label:
+		}
+
+		if sysfsSMA1 && pin.Label == SMA1Label {
 			SMA1Pin = pin
 		}
 	}
@@ -464,16 +547,8 @@ func selectPin(pinsJSON []byte, clockID uint64) (int32, string, error) { //nolin
 
 	choosePPS := false
 	if OnePPSPin != nil {
-		choosePPS = true
 		log.Debugf("selectPin: evaluating 1PPS pin ID=%d with %d parent devices", OnePPSPin.ID, len(OnePPSPin.ParentDevices))
-		for _, parentDev := range OnePPSPin.ParentDevices {
-			log.Debugf("selectPin: 1PPS parent device: direction=%s state=%s", parentDev.Direction, parentDev.State)
-			if parentDev.State != ConnectedState {
-				log.Debugf("selectPin: 1PPS rejected - parent device not connected (state=%s)", parentDev.State)
-				choosePPS = false
-				break
-			}
-		}
+		choosePPS = pinParentsUsable(OnePPSPin, false)
 		if choosePPS {
 			log.Debugf("selectPin: 1PPS pin selected")
 		}
@@ -483,16 +558,8 @@ func selectPin(pinsJSON []byte, clockID uint64) (int32, string, error) { //nolin
 
 	chooseSMA1 := false
 	if SMA1Pin != nil {
-		chooseSMA1 = true
 		log.Debugf("selectPin: evaluating SMA1 pin ID=%d with %d parent devices", SMA1Pin.ID, len(SMA1Pin.ParentDevices))
-		for _, parentDev := range SMA1Pin.ParentDevices {
-			log.Debugf("selectPin: SMA1 parent device: direction=%s state=%s", parentDev.Direction, parentDev.State)
-			if parentDev.Direction != InputDirection || parentDev.State != ConnectedState {
-				log.Debugf("selectPin: SMA1 rejected - parent device invalid (direction=%s, state=%s)", parentDev.Direction, parentDev.State)
-				chooseSMA1 = false
-				break
-			}
-		}
+		chooseSMA1 = pinParentsUsable(SMA1Pin, true)
 		if chooseSMA1 {
 			log.Debugf("selectPin: SMA1 pin selected")
 		}
@@ -513,6 +580,11 @@ func selectPin(pinsJSON []byte, clockID uint64) (int32, string, error) { //nolin
 	log.Debugf("selectPin: no 1PPS or SMA1 pin available, looking for any connected input pin")
 	for _, pin := range entries {
 		if pin.ClockID != clockID {
+			continue
+		}
+
+		// Do not fall back to SMA pins excluded by the sysfs gate
+		if !sysfsSMA1 && (pin.Label == SMA1Label || pin.Label == SMA2Label) {
 			continue
 		}
 
@@ -549,7 +621,7 @@ func postProcessDPLLNetlinkClockID(result map[string]string) (map[string]any, er
 	}
 
 	// Try to select a pin using the NIC's clock ID first
-	offsetPintID, pinType, err := selectPin([]byte(pinsJSON), clockID)
+	offsetPintID, pinType, err := selectPin([]byte(pinsJSON), clockID, result[sysfsPinsKey])
 
 	// If no pins match the NIC's clock ID, try using the clock ID from DPLL devices
 	// This handles cases where DPLL is on a separate timing card (e.g., zl3073x)
@@ -569,7 +641,7 @@ func postProcessDPLLNetlinkClockID(result map[string]string) (map[string]any, er
 				log.Infof("Using DPLL device clock ID %d (module: %s) instead of NIC clock ID %d",
 					fallbackClockID, devices[0].Driver, clockID)
 
-				offsetPintID, pinType, err = selectPin([]byte(pinsJSON), fallbackClockID)
+				offsetPintID, pinType, err = selectPin([]byte(pinsJSON), fallbackClockID, result[sysfsPinsKey])
 				if err == nil {
 					processedResult["clockID"] = fallbackClockID
 				}
