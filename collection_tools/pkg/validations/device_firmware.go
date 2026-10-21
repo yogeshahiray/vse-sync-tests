@@ -24,6 +24,12 @@ var (
 		"0x12dc": true, // E830 (Timed I/O)
 		"0x12dd": true, // E830
 	}
+
+	// TEMPORARY local bypass (do not upstream): gnrd-sno E810 runs NVM 4.12.
+	// Remove this once the NIC firmware is updated to >= 4.20.
+	e810BypassDeviceIDs = map[string]bool{
+		"0x579e": true, // E810-XXV
+	}
 )
 
 func NewDeviceFirmware(ptpDevInfo *devices.PTPDeviceInfo) *VersionCheck {
@@ -31,8 +37,8 @@ func NewDeviceFirmware(ptpDevInfo *devices.PTPDeviceInfo) *VersionCheck {
 
 	// Skip version check for E825/E830 cards
 	minVersion := MinFirmwareVersion
-	if e825e830DeviceIDs[ptpDevInfo.DeviceID] {
-		minVersion = "0.0" // Allow any version for E825/E830
+	if e825e830DeviceIDs[ptpDevInfo.DeviceID] || e810BypassDeviceIDs[ptpDevInfo.DeviceID] {
+		minVersion = "0.0" // Allow any version for exempted cards
 	}
 
 	return &VersionCheck{
