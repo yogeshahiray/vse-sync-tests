@@ -69,6 +69,13 @@ func Detect(kubeConfig, ptpNodeName string, outputAsJSON bool, clockType string)
 	utils.IfErrorExitOrPanic(err)
 	interfaces, err := checkPTPConfig(ctx, clockType)
 	utils.IfErrorExitOrPanic(err)
+
+	// For GM clocks, fall back to the phc2sys source interface as primary when
+	// no ts2phc master port is configured (e.g. the [nmea] GNSS-master convention).
+	if clockType == constants.ClockTypeGM {
+		interfaces = resolvePrimaryFromPhc2Sys(ctx, interfaces)
+	}
+
 	output(os.Stdout, interfaces, outputAsJSON)
 }
 
@@ -117,6 +124,7 @@ func parseConfig(contents string) (map[string][]string, error) {
 var ts2phcNotMaster = regexp.MustCompile(`ts2phc.master\s+0`)
 var ptp4lMasterOnly = regexp.MustCompile(`masterOnly\s+1`)
 var ptp4lServerOnly = regexp.MustCompile(`serverOnly\s+1`)
+var phc2sysSourceFlag = regexp.MustCompile(`(?:^|\s)-s[ =](\S+)`)
 
 func parsePTPClockIndexFromEthtool(out string) (string, bool) {
 	for line := range strings.SplitSeq(out, "\n") {
@@ -196,6 +204,77 @@ func getDetectedInterfaces(ctx clients.ExecContext, config map[string][]string) 
 	}
 
 	return detected
+}
+
+// parsePhc2SysSourceInterfaces extracts the source interfaces (the -s flag) of
+// the phc2sys processes found in ps output.
+func parsePhc2SysSourceInterfaces(psOutput string) []string {
+	sources := []string{}
+
+	for line := range strings.SplitSeq(psOutput, "\n") {
+		if !strings.Contains(line, "phc2sys") {
+			continue
+		}
+
+		if match := phc2sysSourceFlag.FindStringSubmatch(line); match != nil {
+			sources = append(sources, match[1])
+		}
+	}
+
+	return sources
+}
+
+// getPhc2SysSourceInterfaces returns the source interfaces of the phc2sys
+// processes running in the given context. The phc2sys source clock is the PHC
+// that serves as the reference for the time distribution on the node.
+func getPhc2SysSourceInterfaces(ctx clients.ExecContext) ([]string, error) {
+	out, _, err := ctx.ExecCommand([]string{"ps", "aux"})
+	if err != nil {
+		return nil, fmt.Errorf("failed to list processes: %w", err)
+	}
+
+	sources := parsePhc2SysSourceInterfaces(out)
+	if len(sources) == 0 {
+		return nil, errors.New("no phc2sys process with a source interface found")
+	}
+
+	return sources, nil
+}
+
+// resolvePrimaryFromPhc2Sys marks the phc2sys source interface as the primary
+// interface when no ts2phc master port was found. This covers the [nmea]
+// GNSS-master convention where all interfaces are ts2phc sinks
+// (ts2phc.master 0) disciplined by the GNSS receiver of the grand master. In
+// that case the phc2sys source clock is the reference interface of the grand
+// master.
+func resolvePrimaryFromPhc2Sys(ctx clients.ExecContext, interfaces []DetectedInterface) []DetectedInterface {
+	for _, iface := range interfaces {
+		if iface.Primary {
+			return interfaces
+		}
+	}
+
+	sources, err := getPhc2SysSourceInterfaces(ctx)
+	if err != nil {
+		log.Warnf("Failed to determine the phc2sys source interface: %v", err)
+		return interfaces
+	}
+
+	for _, source := range sources {
+		for i := range interfaces {
+			if interfaces[i].Name == source {
+				log.Infof("No ts2phc master port found, using the phc2sys source interface %s as primary", source)
+
+				interfaces[i].Primary = true
+
+				return interfaces
+			}
+		}
+	}
+
+	log.Warnf("The phc2sys source interface(s) %v were not found among the detected interfaces", sources)
+
+	return interfaces
 }
 
 func checkPTPConfig(ctx clients.ExecContext, clockType string) ([]DetectedInterface, error) {
