@@ -33,5 +33,9 @@ func NewDPLLCollector(constructor *CollectionConstructor) (Collector, error) {
 }
 
 func init() {
-	RegisterCollector(DPLLCollectorName, NewDPLLCollector, optional)
+	// The DPLL collector is opt-in: the linuxptp-daemon already logs DPLL
+	// monitoring data which the test suite analyses, so it is not run by
+	// default. Select it explicitly with --collector DPLL when pin level
+	// data (e.g. SMA1 measurements) is required.
+	RegisterCollector(DPLLCollectorName, NewDPLLCollector, optin)
 }
