@@ -201,3 +201,6 @@ vendor/
 # Compiled Go binaries
 collection_tools/collection_tools
 
+
+# Test run output data
+data/
